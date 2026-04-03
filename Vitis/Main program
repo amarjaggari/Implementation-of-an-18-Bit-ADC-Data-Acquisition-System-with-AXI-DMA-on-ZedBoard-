@@ -1,0 +1,88 @@
+#include <stdio.h>
+#include "sleep.h"
+#include "xparameters.h"
+#include "xaxidma.h"
+#include "xil_cache.h"
+#include "xuartps_hw.h"
+#define DMA_DEV_ID XPAR_AXIDMA_0_DEVICE_ID
+#define UART_BASEADDR XPAR_PS7_UART_1_BASEADDR
+#define PACKET_SIZE 16 // Must match DMA transfer
+#define BUFFER_BYTES (PACKET_SIZE * 4)
+#define V_REF 5.0f
+#define ADC_MAX_STEPS 262143.0f // 18-bit resolution
+XAxiDma AxiDma;
+u32 RxBuffer[PACKET_SIZE] __attribute__ ((aligned(32)));
+int init_dma() {
+ XAxiDma_Config *CfgPtr;
+ int status;
+ printf("Looking up DMA config...\r\n");
+ CfgPtr = XAxiDma_LookupConfig(DMA_DEV_ID);
+ if (!CfgPtr) { printf("ERROR: No DMA config found\r\n"); return XST_FAILURE; }
+ printf("Initializing DMA...\r\n");
+ status = XAxiDma_CfgInitialize(&AxiDma, CfgPtr);
+ if (status != XST_SUCCESS) { printf("ERROR: DMA init failed\r\n"); return 
+XST_FAILURE; }
+ if (XAxiDma_HasSg(&AxiDma)) { printf("ERROR: DMA in SG mode\r\n"); return 
+XST_FAILURE; }
+ printf("DMA Initialized Successfully\r\n");
+ return XST_SUCCESS;
+}
+int start_dma() {
+ int status;
+ Xil_DCacheFlushRange((UINTPTR)RxBuffer, BUFFER_BYTES);
+ status = XAxiDma_SimpleTransfer(&AxiDma, (UINTPTR)RxBuffer,
+ BUFFER_BYTES, XAXIDMA_DEVICE_TO_DMA);
+ if (status != XST_SUCCESS) { printf("ERROR: DMA transfer failed\r\n"); return 
+XST_FAILURE; }
+ return XST_SUCCESS;
+}
+int wait_for_dma() {
+ int timeout = 10000000;
+ while (XAxiDma_Busy(&AxiDma, XAXIDMA_DEVICE_TO_DMA)) {
+ if (--timeout == 0) { printf("ERROR: DMA TIMEOUT!\r\n"); return 
+XST_FAILURE; }
+ }
+ Xil_DCacheInvalidateRange((UINTPTR)RxBuffer, BUFFER_BYTES);
+ return XST_SUCCESS;
+}
+void process_data() {
+printf("\r\n--- ADC Packet ---\r\n");
+ for (int i = 0; i < 4; i++) {
+ u32 sample = RxBuffer[i];
+ u32 sign = (sample >> 18) & 0x1;
+ u32 magnitude = sample & 0x0003FFFF;
+ float voltage;
+ if (sign)
+ voltage = -((float)magnitude / ADC_MAX_STEPS) * V_REF;
+ else
+ voltage = ((float)magnitude / ADC_MAX_STEPS) * V_REF;
+ printf("Sample %02d | Raw: 0x%08X | Mag: %6u | Volt: %7.4f V\r\n",
+ i, sample, magnitude, voltage);
+ }
+}
+int main() {
+ int status;
+ int print_enable = 1;
+ printf("\r\n====================================\r\n");
+ printf(" ADC DMA MONITOR STARTED\r\n");
+ printf("====================================\r\n");
+ printf("Press 'p' = pause, 'r' = resume\r\n");
+ status = init_dma();
+ if (status != XST_SUCCESS) return XST_FAILURE;
+ while (1) {
+ if (XUartPs_IsReceiveData(UART_BASEADDR)) {
+ u8 c = XUartPs_ReadReg(UART_BASEADDR, XUARTPS_FIFO_OFFSET);
+ if (c == 'p' || c == 'P') { print_enable = 0; 
+printf("\r\n[PAUSED]\r\n"); }
+ else if (c == 'r' || c == 'R') { print_enable = 1; 
+printf("\r\n[RESUMED]\r\n"); }
+ }
+ status = start_dma();
+ if (status != XST_SUCCESS) return XST_FAILURE;
+ status = wait_for_dma();
+ if (status != XST_SUCCESS) return XST_FAILURE;
+ if (print_enable) process_data();
+ usleep(200000); // 200 ms delay
+ }
+ return XST_SUCCESS;
+}
